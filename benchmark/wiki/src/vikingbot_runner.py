@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 sys.path.append(str(Path(__file__).parent))
 
 from core.logger import get_logger
+from cluster_catalog import build_cluster_catalog
 
 logger = get_logger()
 
@@ -67,6 +68,10 @@ def _generate_temp_ov_conf(
     llm_config: dict | None = None,
     embedding_config: dict | None = None,
     server_port: int | None = None,
+    tool_iterations: int | None = None,
+    evidence_gain_stop: bool = False,
+    evidence_gain_patience: int | None = None,
+    evidence_gain_min_iteration: int | None = None,
 ) -> str:
     with open(original_conf_path, "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -80,6 +85,20 @@ def _generate_temp_ov_conf(
 
     storage = config.setdefault("storage", {})
     storage["workspace"] = vector_store_path
+
+    if tool_iterations is not None or evidence_gain_stop:
+        # ``agents`` is VikingBot-only configuration. It must live below
+        # ``bot``: OpenViking validates its own root config before the Bot
+        # loader consumes this section.
+        bot = config.setdefault("bot", {})
+        agents = bot.setdefault("agents", {})
+        if tool_iterations is not None:
+            agents["max_tool_iterations"] = max(1, int(tool_iterations))
+        agents["evidence_gain_stop_enabled"] = True
+        if evidence_gain_patience is not None:
+            agents["evidence_gain_patience"] = max(1, int(evidence_gain_patience))
+        if evidence_gain_min_iteration is not None:
+            agents["evidence_gain_min_iteration"] = max(1, int(evidence_gain_min_iteration))
 
     log_config = config.setdefault("log", {})
     log_config["output"] = "stdout"
@@ -127,18 +146,91 @@ def _generate_temp_ov_conf(
     return str(temp_conf_path)
 
 
-def prepare_openviking_config(config: Dict[str, Any], original_conf_path: str) -> str:
+def prepare_openviking_config(config: Dict[str, Any], original_conf_path: str, question: str = "") -> str:
     vector_store_path = config.get("paths", {}).get("vector_store")
     if not vector_store_path:
         raise ValueError("paths.vector_store is required")
+    execution = config.get("execution", {})
     return _generate_temp_ov_conf(
         original_conf_path,
         vector_store_path,
         llm_config=config.get("llm"),
         embedding_config=config.get("embedding"),
-        server_port=config.get("execution", {}).get("server_port"),
+        server_port=execution.get("server_port"),
+        tool_iterations=_tool_iteration_budget(execution, question),
+        # Benchmark QA enables local evidence-gain stopping by default. It remains opt-out
+        # here and opt-in in VikingBot's global configuration, so normal Bot sessions do not
+        # inherit this benchmark-specific retrieval policy.
+        evidence_gain_stop=bool(execution.get("evidence_gain_stop", True)),
+        evidence_gain_patience=execution.get("evidence_gain_patience"),
+        evidence_gain_min_iteration=execution.get("evidence_gain_min_iteration"),
     )
 
+
+def _tool_iteration_budget(execution: Dict[str, Any], question: str) -> int | None:
+    """Set a real per-question Agent limit while preserving room for synthesis."""
+    explicit = execution.get("max_tool_iterations")
+    if explicit is not None:
+        return max(1, int(explicit))
+    if str(execution.get("tool_budget_mode", "adaptive")).lower() != "adaptive":
+        return None
+    text = str(question).casefold()
+    complex_markers = (
+        "compare", "comparison", "difference", "trend", "evolution", "survey", "review",
+        "advantages", "disadvantages", "limitations", "challenges", "why", "how", "what are",
+    )
+    return 5 if len(text) > 180 or any(marker in text for marker in complex_markers) else 3
+
+
+
+def _tool_policy_instruction(config: Dict[str, Any]) -> str:
+    policy = str(config.get("execution", {}).get("tool_policy", "") or "").strip().lower()
+    if policy == "hard_cap":
+        return (
+            "Hard cap the search chain: stop after at most 3 search rounds and avoid extra "
+            "list/grep loops once sufficient evidence is found."
+        )
+    if policy == "dedup":
+        return (
+            "Deduplicate repeated searches, lists, and reads; if the same evidence is already "
+            "seen, do not re-run the same tool pattern."
+        )
+    if policy == "early_stop":
+        return (
+            "Stop as soon as the answer is supported; do not continue searching for extra "
+            "evidence after the key facts are already sufficient."
+        )
+    return ""
+
+
+def _retrieval_strategy_instruction(config: Dict[str, Any]) -> str:
+    strategy = str(
+        config.get("execution", {}).get("retrieval_strategy", "") or ""
+    ).strip().lower()
+    if strategy == "cluster_catalog":
+        return ("MANDATORY RETRIEVAL PROTOCOL: A query-scoped catalog below was built by retrieving relevant "
+                "original chunks then expanding only their linked Wiki topics. Read this catalog first. For detail, "
+                "read only original-document URIs listed in it; do not enumerate the full Wiki/resources. A new "
+                "subquestion may trigger one new chunk-to-catalog loop.")
+    if strategy != "wiki_first":
+        return ""
+    execution = config.get("execution", {})
+    wiki_root_uri = str(execution.get("wiki_root_uri", "viking://wiki/") or "viking://wiki/").rstrip("/")
+    wiki_topk = max(1, int(execution.get("wiki_retrieval_topk", 5) or 5))
+    fallback_topk = max(1, int(execution.get("original_fallback_topk", 3) or 3))
+    return (
+        "MANDATORY RETRIEVAL PROTOCOL: Your first OpenViking search call must use "
+        f"target_uri=\"{wiki_root_uri}\" and return at most {wiki_topk} hits. Read the "
+        "returned node cards/documents as a temporary, bounded Wiki directory before deciding "
+        "whether they answer the question. Only inspect items in that temporary directory; do not "
+        "enumerate the whole Wiki. Do not search "
+        "viking://resources or use the default search scope until you have checked the Wiki. "
+        "If the Wiki evidence fully covers the question, answer from the Wiki and stop. "
+        "Do not call list, grep, glob, or repeated searches after a relevant Wiki node is read. "
+        "Only when the Wiki has no relevant node or lacks a required fact, make one second-stage "
+        f"search with target_uri=\"viking://resources\" and read at most the top {fallback_topk} original documents. "
+        "Then answer; never run another exploratory search round."
+    )
 
 def _healthcheck(url: str, timeout: float = 1.5) -> bool:
     try:
@@ -226,10 +318,8 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
             _stop_openviking_server()
 
         if _healthcheck(health_url):
-            raise RuntimeError(
-                f"OpenViking server port is already occupied at {server_url}; "
-                "stop the existing server or choose another execution.server_port"
-            )
+            logger.info("Reusing healthy OpenViking server at %s", server_url)
+            return
         if _tcp_port_open(server_url):
             raise RuntimeError(
                 f"OpenViking server port is already occupied at {server_url} but /health is unavailable; "
@@ -362,27 +452,25 @@ class VikingBotRunner:
             ov_conf_path = prepare_openviking_config(self.config, self.ov_conf_path)
             logger.info(f"Using vector store: {self.vector_store_path}")
             _ensure_openviking_server(ov_conf_path)
+            policy_instruction = _tool_policy_instruction(self.config)
+            retrieval_instruction = _retrieval_strategy_instruction(self.config)
+            server_url, server_key = _load_server_url_and_key(ov_conf_path)
+            cluster_catalog = build_cluster_catalog(question, self.config, server_url, server_key)
 
-            wiki_root = str(
-                self.config.get("execution", {}).get("wiki_root_uri")
-                or "viking://wiki/"
-            ).rstrip("/")
-            wiki_topk = int(self.config.get("execution", {}).get("wiki_retrieval_topk", 5) or 5)
-            fallback_topk = int(self.config.get("execution", {}).get("original_fallback_topk", 3) or 3)
-            max_rounds = int(self.config.get("execution", {}).get("max_retrieval_rounds", 2) or 2)
             input_msg = (
-                "Answer the question using only the database and be concise. "
-                "Follow this retrieval policy exactly:\n"
-                f"1) Wiki-first: search the Wiki root {wiki_root} with at most {wiki_topk} hits. "
-                "Read the returned Wiki node cards/documents and treat them as a temporary, bounded catalog. "
-                "Only use content present in that catalog; do not enumerate the entire Wiki.\n"
-                "2) Decide whether the catalog contains enough evidence. If yes, answer immediately. "
-                f"If not, perform at most one fallback search over original resources, reading at most {fallback_topk} results.\n"
-                f"3) Use at most {max_rounds} retrieval rounds total. Do not issue exploratory list, glob, or grep calls. "
-                "Do not use external sources. Cite source titles or URIs when available."
-                f"\n\nQuestion: {question}"
+                "Answer this question as briefly as possible. "
+                "Use only the information available in the database. "
+                "Do not use any external source. "
+                "Always use OpenViking tools first. Search first, then read the results to answer. "
+                "Keep tool use tight: prefer 1-3 search rounds, read only the most relevant hits, "
+                "and avoid repeated grep/list loops once the answer is clear. "
+                "Search results may come from original resources or wiki nodes. "
+                "When a retrieval strategy is supplied below, follow it exactly."
+                + (f" {policy_instruction}" if policy_instruction else "")
+                + (f" {retrieval_instruction}" if retrieval_instruction else "")
+                + ("\n\n" + cluster_catalog if cluster_catalog else "")
+                + f"\n\nQuestion: {question}"
             )
-
             safe_session_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id)
             output_file = _runtime_dir() / "bot_json" / f"{safe_session_id}.json"
             output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -416,11 +504,11 @@ class VikingBotRunner:
                 _ACTIVE_BOT_PROCESSES.add(proc)
             pid = proc.pid
             try:
-                stdout, stderr = proc.communicate(timeout=600)
+                stdout, stderr = proc.communicate(timeout=1800)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 stdout, stderr = proc.communicate()
-                raise subprocess.TimeoutExpired(cmd, 600)
+                raise subprocess.TimeoutExpired(cmd, 1800)
             finally:
                 with _BOT_PROC_LOCK:
                     _ACTIVE_BOT_PROCESSES.discard(proc)

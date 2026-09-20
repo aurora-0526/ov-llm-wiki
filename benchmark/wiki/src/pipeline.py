@@ -123,11 +123,13 @@ class BenchmarkPipeline:
         wiki_max_card_input_chars = int(
             self.config['execution'].get('wiki_max_card_input_chars', 20000)
         )
+        wiki_root_uri = self.config['execution'].get('wiki_root_uri', 'viking://wiki/')
         self.logger.info(f"Building Wiki for {len(resource_uris)} resource roots")
         wiki_stats = self.db.build_wiki(
             resource_uris=resource_uris,
             card_input_mode=wiki_card_input_mode,
             max_card_input_chars=wiki_max_card_input_chars,
+            wiki_root_uri=wiki_root_uri,
         )
         token_usage = wiki_stats.get("token_usage") or {}
         # OpenViking normally returns ``total_usage``; accept a flat usage

@@ -1,4 +1,4 @@
-"""Generate Wiki node documents."""
+"""Steps 5 and 6: generate node.md and node documents."""
 
 from __future__ import annotations
 
@@ -9,10 +9,15 @@ from typing import TypeVar
 from pydantic import ValidationError
 
 from .llm import WikiLLMRunner
-from .prompts import build_node_documents_prompt
+from .prompts import (
+    build_node_documents_prompt,
+    build_node_md_prompt,
+    build_parent_node_documents_prompt,
+)
 from .schemas import (
     NodeDocument,
     NodeDocumentsResponse,
+    NodeMarkdownResponse,
     WikiNode,
 )
 
@@ -25,18 +30,41 @@ class NodeContentGenerator:
     def __init__(self, llm: WikiLLMRunner):
         self.llm = llm
 
+    async def generate_node_md(self, node: WikiNode) -> str:
+        return await _complete_with_validation_retry(
+            self.llm,
+            step="node_md",
+            prompt=build_node_md_prompt(node),
+            schema=NodeMarkdownResponse.model_json_schema(),
+            node_id=node.node_id,
+            validate=lambda result: self._parse_node_md_result(node, result),
+        )
+
+    def _parse_node_md_result(self, node: WikiNode, result: dict) -> str:
+        response = NodeMarkdownResponse.model_validate(result)
+        node_md = response.node_md.strip()
+        if not node_md:
+            raise RuntimeError(f"node_md for {node.node_id} is empty")
+        return node_md
+
     async def generate_node_documents(
         self,
         node: WikiNode,
         source_documents: list[dict],
         *,
-        max_source_chars: int = 60000,
-        max_source_chars_per_document: int = 8000,
+        max_input_chars: int = 60000,
+        max_chars_per_source: int = 8000,
+        microcluster_chars: int = 18000,
+        max_evidence_cards: int = 8,
     ) -> list[NodeDocument]:
-        source_documents = _build_evidence_pack(
+        if _source_char_count(source_documents) > max_input_chars:
+            source_documents = await self._evidence_cards(
+                node, source_documents, max_input_chars, max_chars_per_source, microcluster_chars, max_evidence_cards
+            )
+        source_documents = _pack_source_documents(
             source_documents,
-            max_source_chars=max_source_chars,
-            max_source_chars_per_document=max_source_chars_per_document,
+            max_input_chars=max_input_chars,
+            max_chars_per_source=max_chars_per_source,
         )
         prompt = build_node_documents_prompt(
             node,
@@ -54,11 +82,85 @@ class NodeContentGenerator:
             ),
         )
 
+    async def _evidence_cards(
+        self, node: WikiNode, sources: list[dict], max_input_chars: int, max_chars_per_source: int,
+        microcluster_chars: int, max_evidence_cards: int
+    ) -> list[dict]:
+        """Map large topics into topic-hinted, URI-preserving evidence cards."""
+        groups: dict[str, list[dict]] = {}
+        for source in sources:
+            hints = sorted({str(hint).strip() for hint in (source.get("topic_hints") or []) if str(hint).strip()})
+            key = " | ".join(hints[:2]) or "other evidence"
+            groups.setdefault(key, []).append(source)
+        cards: list[dict] = []
+        card_limit = max(1, int(max_evidence_cards))
+        ordered_groups = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
+        selected_groups = [[hint, list(group)] for hint, group in ordered_groups[:card_limit]]
+        # Preserve evidence coverage when a topic has more subgroups than cards:
+        # distribute smaller residual groups instead of silently dropping them.
+        for index, (_, group) in enumerate(ordered_groups[card_limit:]):
+            selected_groups[index % len(selected_groups)][1].extend(group)
+        per_group = max(4000, min(int(microcluster_chars), max_input_chars // max(1, len(selected_groups))))
+        for index, (hint, group) in enumerate(selected_groups):
+            packed = _pack_source_documents(group, max_input_chars=per_group, max_chars_per_source=max_chars_per_source)
+            evidence_node = node.model_copy(update={"scope": f"Evidence card for subtopic {hint}. {node.scope}"})
+            evidence = await _complete_with_validation_retry(
+                self.llm, step="node_evidence_card", prompt=build_node_documents_prompt(evidence_node, packed),
+                schema=NodeDocumentsResponse.model_json_schema(), node_id=node.node_id,
+                validate=lambda result: self._parse_node_documents_result(node, result),
+            )
+            cards.append({"doc_id": f"evidence_card_{index}", "topic_hints": [hint], "sections": [
+                {"section_uri": f"evidence://{node.node_id}/{index}", "content": doc.content} for doc in evidence
+            ]})
+        return cards or sources
+
+    async def generate_parent_node_documents(
+        self,
+        node: WikiNode,
+        child_nodes: list[dict],
+        *,
+        max_input_chars: int = 60000,
+        max_chars_per_source: int = 8000,
+    ) -> list[NodeDocument]:
+        child_nodes = _pack_child_node_documents(
+            child_nodes,
+            max_input_chars=max_input_chars,
+            max_chars_per_source=max_chars_per_source,
+        )
+        prompt = build_parent_node_documents_prompt(
+            node,
+            child_nodes,
+        )
+        return await _complete_with_validation_retry(
+            self.llm,
+            step="parent_node_documents",
+            prompt=prompt,
+            schema=NodeDocumentsResponse.model_json_schema(),
+            node_id=node.node_id,
+            validate=lambda result: self._parse_parent_node_documents_result(
+                node,
+                result,
+            ),
+        )
+
     def _parse_node_documents_result(
         self,
         node: WikiNode,
         result: dict,
     ) -> list[NodeDocument]:
+        result = _normalize_node_documents_result(result)
+        response = NodeDocumentsResponse.model_validate(result)
+        documents = _build_node_documents(response.documents)
+        if not documents:
+            raise RuntimeError(f"node_documents for {node.node_id} is empty")
+        return documents
+
+    def _parse_parent_node_documents_result(
+        self,
+        node: WikiNode,
+        result: dict,
+    ) -> list[NodeDocument]:
+        result = _normalize_node_documents_result(result)
         response = NodeDocumentsResponse.model_validate(result)
         documents = _build_node_documents(response.documents)
         if not documents:
@@ -66,51 +168,88 @@ class NodeContentGenerator:
         return documents
 
 
-def _build_evidence_pack(
-    source_documents: list[dict],
-    *,
-    max_source_chars: int,
-    max_source_chars_per_document: int,
-) -> list[dict]:
-    """Bound compiler input while retaining coverage across the cluster.
+def _normalize_node_documents_result(result: dict) -> dict:
+    """Accept legacy LLM output where documents are plain content strings."""
+    if not isinstance(result, dict):
+        return result
+    raw_documents = result.get("documents")
+    if not isinstance(raw_documents, list):
+        return result
+    normalized = dict(result)
+    normalized["documents"] = [
+        {"content": item} if isinstance(item, str) else item
+        for item in raw_documents
+    ]
+    return normalized
 
-    Documents are sampled in round-robin order and each document keeps its
-    section headers/URIs. This is deliberately deterministic, so reruns do
-    not change the Wiki solely because of sampling order.
-    """
-    docs = list(source_documents or [])
-    if not docs:
-        return []
-    total_budget = max(4000, int(max_source_chars or 60000))
-    per_doc = max(1000, int(max_source_chars_per_document or 8000))
-    selected: list[dict] = []
+
+def _clip_evidence(text: str, budget: int) -> str:
+    if len(text) <= budget:
+        return text
+    if budget < 80:
+        return text[:budget]
+    return text[: budget - 16].rstrip() + "\n...(truncated)"
+
+
+def _source_char_count(sources: list[dict]) -> int:
+    return sum(len(str(section.get("content", ""))) for source in sources for section in source.get("sections", []))
+
+
+def _pack_source_documents(
+    source_documents: list[dict], *, max_input_chars: int, max_chars_per_source: int
+) -> list[dict]:
+    """Preserve broad source coverage while bounding a leaf-topic compile."""
+    total_budget = max(4000, int(max_input_chars))
+    per_source_budget = max(1000, int(max_chars_per_source))
+    packed: list[dict] = []
     used = 0
-    for index, doc in enumerate(docs):
-        sections = list(doc.get("sections") or [])
-        if not sections:
-            continue
-        # Every source gets a chance to contribute before any source gets a
-        # second section, which avoids large documents dominating the pack.
-        compact_sections = []
-        remaining_doc = per_doc
-        for section in sections:
-            if remaining_doc <= 0 or used >= total_budget:
+    for source in source_documents:
+        remaining = min(per_source_budget, total_budget - used)
+        if remaining <= 0:
+            break
+        sections: list[dict] = []
+        for section in source.get("sections", []):
+            if remaining <= 0:
                 break
-            content = str(section.get("content") or "")
+            content = str(section.get("content", "")).strip()
             if not content:
                 continue
-            remaining = min(remaining_doc, total_budget - used)
-            if len(content) > remaining:
-                content = content[: max(200, remaining - 24)].rstrip() + "\n...(truncated)"
-            compact_sections.append({**section, "content": content})
-            consumed = len(content)
-            remaining_doc -= consumed
-            used += consumed
-        if compact_sections:
-            selected.append({**doc, "sections": compact_sections})
-        if used >= total_budget:
+            clipped = _clip_evidence(content, remaining)
+            sections.append({**section, "content": clipped})
+            used += len(clipped)
+            remaining -= len(clipped)
+        if sections:
+            packed.append({**source, "sections": sections})
+    return packed
+
+
+def _pack_child_node_documents(
+    child_nodes: list[dict], *, max_input_chars: int, max_chars_per_source: int
+) -> list[dict]:
+    """Bound parent compilation without letting a verbose child dominate."""
+    total_budget = max(4000, int(max_input_chars))
+    per_source_budget = max(1000, int(max_chars_per_source))
+    packed: list[dict] = []
+    used = 0
+    for child in child_nodes:
+        remaining = min(per_source_budget, total_budget - used)
+        if remaining <= 0:
             break
-    return selected
+        documents: list[dict] = []
+        for document in child.get("documents", []):
+            if remaining <= 0:
+                break
+            content = str(document.get("content", "")).strip()
+            if not content:
+                continue
+            clipped = _clip_evidence(content, remaining)
+            documents.append({**document, "content": clipped})
+            used += len(clipped)
+            remaining -= len(clipped)
+        if documents:
+            packed.append({**child, "documents": documents})
+    return packed
+
 
 def _build_node_documents(document_contents: list) -> list[NodeDocument]:
     return [

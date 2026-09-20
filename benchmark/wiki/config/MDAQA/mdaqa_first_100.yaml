@@ -7,13 +7,13 @@ adapter:
 
 execution:
   mode: "vikingbot"
-  server_port: 2027
-  max_workers: 8
+  server_port: 2026
+  max_workers: 1
   retrieval_topk: 5
   max_queries: null
   skip_ingestion: false
   ingest_mode: "directory"
-  build_wiki: true
+  build_wiki: false
   wiki_card_input_mode: "summary"
   wiki_max_card_input_chars: 20000
   retrieval_instruction: ""

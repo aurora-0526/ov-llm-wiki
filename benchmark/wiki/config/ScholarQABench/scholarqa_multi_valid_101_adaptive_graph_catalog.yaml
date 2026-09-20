@@ -1,5 +1,5 @@
 project_name: "Wiki_Benchmark"
-dataset_name: "scholarqa_multi_valid_101"
+dataset_name: "scholarqa_multi_valid_101_adaptive_graph_catalog"
 
 adapter:
   module: "src.adapters.scholarqa_multi_adapter"
@@ -7,16 +7,18 @@ adapter:
 
 execution:
   mode: "vikingbot"
-  server_port: 2026
+  server_port: 2031
   max_workers: 1
   retrieval_topk: 5
   max_queries: null
-  skip_ingestion: false
+  # Reuse the existing viking://resources/scholarqa_multi_valid_101_processed_docs corpus.
+  skip_ingestion: true
   ingest_mode: "directory"
-  build_wiki: false
+  build_wiki: true
   wiki_card_input_mode: "summary"
   wiki_max_card_input_chars: 20000
-  retrieval_strategy: "wiki_first"
+  retrieval_strategy: "cluster_catalog"
+  wiki_root_uri: "viking://wiki/scholarqa_multi_valid_101_adaptive_graph_catalog/"
   retrieval_instruction: ""
 
 paths:

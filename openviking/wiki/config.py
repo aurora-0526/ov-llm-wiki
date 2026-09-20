@@ -8,6 +8,13 @@ from typing import Any
 
 @dataclass
 class WikiGenerationLimits:
+    use_candidate_graph_clustering: bool = True
+    # Zero selects a corpus-relative candidate budget / edge threshold. Positive
+    # values are explicit overrides for controlled ablations.
+    candidate_graph_k: int = 0
+    candidate_graph_edge_threshold: float = 0.0
+    max_cards_per_discovery_batch: int = 200
+    max_parents_per_child: int = 4
     # 最多向上聚合多少层 Wiki 节点。
     max_depth: int = 6
     # 父节点至少要覆盖多少个子节点，否则不会保留。
@@ -18,11 +25,16 @@ class WikiGenerationLimits:
     max_concurrent_cards: int = 10
     # 同时发起多少个节点内容生成请求。
     max_concurrent_nodes: int = 10
-    # Upper bound for source evidence sent to one node compiler.  Large
-    # clusters are represented by a coverage-preserving evidence pack rather
-    # than exhausting the model context with every raw section.
-    max_node_source_chars: int = 60000
-    max_source_chars_per_document: int = 8000
+    # Bound one compile request. Large clusters are represented by a
+    # coverage-preserving evidence pack rather than their entire raw corpus.
+    max_compile_input_chars: int = 60000
+    max_compile_chars_per_source: int = 8000
+    compile_microcluster_chars: int = 18000
+    max_compile_evidence_cards: int = 8
+    # The adaptive compiler may expand a coherent medium topic up to this cap;
+    # it still map-reduces large or diverse topics instead of consuming a model's
+    # full context window.
+    max_adaptive_compile_input_chars: int = 240000
 
 
 @dataclass

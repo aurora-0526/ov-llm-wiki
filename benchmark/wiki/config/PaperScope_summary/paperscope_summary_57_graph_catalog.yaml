@@ -1,5 +1,5 @@
 project_name: "Wiki_Benchmark"
-dataset_name: "paperscope_summary_93_gap"
+dataset_name: "paperscope_summary_57_graph_catalog"
 
 adapter:
   module: "src.adapters.paperscope_summary_adapter"
@@ -7,21 +7,24 @@ adapter:
 
 execution:
   mode: "vikingbot"
-  server_port: 2026
+  server_port: 2033
   max_workers: 1
   retrieval_topk: 5
   max_queries: null
-  skip_ingestion: false
+  # Reuse the recovered PaperScope57 resource store and vector index.
+  skip_ingestion: true
   ingest_mode: "directory"
-  build_wiki: false
+  build_wiki: true
   wiki_card_input_mode: "summary"
   wiki_max_card_input_chars: 20000
+  retrieval_strategy: "cluster_catalog"
+  wiki_root_uri: "viking://wiki/paperscope_summary_57_graph_catalog/"
   retrieval_instruction: ""
 
 paths:
-  dataset_path: "datasets/PaperScopeSummary93/summary_gap.jsonl"
-  doc_output_dir: "wiki_storage/paperscope_summary_93/paperscope_summary_93_processed_docs"
-  vector_store: "wiki_storage/paperscope_summary_93/paperscope_summary_93_viking_store_index"
+  dataset_path: "datasets/PaperScopeSummary57/summary_trend.jsonl"
+  doc_output_dir: "wiki_storage/paperscope_summary_57/paperscope_summary_57_processed_docs"
+  vector_store: "wiki_storage/paperscope_summary_57/paperscope_summary_57_viking_store_index"
   output_dir: "Output/{dataset_name}/wiki"
   log_file: "Output/{dataset_name}/wiki/benchmark.log"
 

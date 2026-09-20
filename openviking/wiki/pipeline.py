@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import asdict
 
 from .assignments import SourceRefBuilder
@@ -21,21 +22,20 @@ from .schemas import (
     ResourceDocument,
     SourceAssignmentResult,
     SourceRef,
-    WikiNode,
     WikiResourceInput,
+    WikiNode,
 )
 from .uri import (
-    card_json_uri,
     card_md_uri,
-    node_card_json_uri,
-    node_card_md_uri,
+    cards_dir,
     node_document_uri,
-    node_root_uri,
+    node_md_uri,
     node_sources_dir,
     run_dir,
     wiki_root,
 )
 from .writer import WikiVikingFSWriter
+
 
 logger = logging.getLogger(__name__)
 _SENSITIVE_CONFIG_KEYS = {
@@ -71,9 +71,6 @@ class WikiPipeline:
         self.source_ref_builder = SourceRefBuilder(self.config)
         self.content_generator = NodeContentGenerator(self.llm)
         self.layer_decision_runner = LayerDecisionRunner(self.llm)
-
-    def get_token_usage(self) -> dict[str, Any]:
-        return self.llm.get_token_usage()
 
     async def run_from_inputs(
         self,
@@ -142,37 +139,32 @@ class WikiPipeline:
         artifacts: PipelineArtifacts,
         resource_documents_by_id: dict[str, ResourceDocument],
     ) -> PipelineArtifacts:
-        all_cards: list[DocumentCard] = list(cards)
-        source_documents_by_id = dict(resource_documents_by_id)
-        artifacts.cards = all_cards
+        artifacts.cards = cards
         await self._write_cards(cards)
 
         all_nodes: list[WikiNode] = []
         all_source_refs_by_node: dict[str, list[SourceRef]] = {}
         all_unassigned_source_ids: list[str] = []
         all_contexts: list[GeneratedNodeContext] = []
-        previous_layer_cards: list[DocumentCard] = []
-        reserved_node_ids = {card.doc_id for card in cards}
+        previous_layer_contexts: list[GeneratedNodeContext] = []
 
         for depth in range(1, self.config.limits.max_depth + 1):
-            source_cards = cards if depth == 1 else previous_layer_cards
+            source_contexts = previous_layer_contexts
             if depth == 1:
-                min_sources = self.config.limits.min_refs_per_node
-                logger.info("[Wiki] Discovering bottom-layer nodes from %d card topics", len(source_cards))
+                logger.info("[Wiki] Discovering bottom-layer nodes from %d card topics", len(cards))
+                bottom_discovery = await self.node_discovery.discover_bottom_layer(cards, depth=depth)
+                layer_nodes = bottom_discovery.nodes
             else:
-                min_sources = self.config.limits.min_child_nodes_per_parent
                 logger.info(
-                    "[Wiki] Discovering depth=%d parent nodes from %d previous-layer cards",
+                    "[Wiki] Discovering depth=%d parent nodes from %d previous-layer contexts",
                     depth,
-                    len(source_cards),
+                    len(source_contexts),
                 )
-            discovery = await self.node_discovery.discover_layer(
-                source_cards,
-                depth=depth,
-                min_sources_per_node=min_sources,
-                reserved_node_ids=reserved_node_ids,
-            )
-            layer_nodes = discovery.nodes
+                parent_discovery = await self.node_discovery.discover_parent_layer(
+                    source_contexts,
+                    depth=depth,
+                )
+                layer_nodes = parent_discovery.nodes
 
             active_nodes = [node for node in layer_nodes if node.status == "active"]
             logger.info(
@@ -186,18 +178,35 @@ class WikiPipeline:
                     raise RuntimeError("bottom layer produced no active nodes")
                 break
 
-            logger.info(
-                "[Wiki] Building source refs for %d nodes from %d source cards",
-                len(active_nodes),
-                len(source_cards),
-            )
-            assignment_result = SourceAssignmentResult(
-                source_refs_by_node=self.source_ref_builder.build_refs_by_node(
-                    discovery.source_assignments.assignments,
-                    source_cards,
-                ),
-                unassigned_source_ids=discovery.source_assignments.unassigned_source_ids,
-            )
+            if depth == 1:
+                logger.info(
+                    "[Wiki] Building source refs for %d bottom-layer nodes from topic aggregation",
+                    len(active_nodes),
+                )
+                assignment_result = SourceAssignmentResult(
+                    source_refs_by_node=self.source_ref_builder.build_document_refs_by_node(
+                        bottom_discovery.source_assignments.assignments,
+                        cards,
+                    ),
+                    unassigned_source_ids=bottom_discovery.source_assignments.unassigned_source_ids,
+                )
+            else:
+                logger.info(
+                    "[Wiki] Building source refs for %d parent nodes from child-node aggregation",
+                    len(active_nodes),
+                )
+                child_node_ids_by_node = {
+                    item.node_id: item.source_ids
+                    for item in parent_discovery.source_assignments.assignments
+                }
+                assignment_result = SourceAssignmentResult(
+                    source_refs_by_node=self.source_ref_builder.build_child_refs_by_node(
+                        child_node_ids_by_node,
+                        source_contexts,
+                    ),
+                    child_node_ids_by_node=child_node_ids_by_node,
+                    unassigned_source_ids=parent_discovery.source_assignments.unassigned_source_ids,
+                )
             logger.info(
                 "[Wiki] Depth=%d produced %d source refs",
                 depth,
@@ -208,7 +217,9 @@ class WikiPipeline:
                 layer_nodes,
                 active_nodes,
                 assignment_result,
-                min_sources=min_sources,
+                min_refs_per_node=self.config.limits.min_refs_per_node,
+                min_child_nodes_per_parent=self.config.limits.min_child_nodes_per_parent,
+                child_contexts=source_contexts,
                 depth=depth,
             )
             if not active_nodes:
@@ -218,10 +229,9 @@ class WikiPipeline:
             logger.info("[Wiki] Depth=%d retained %d supported active nodes", depth, len(active_nodes))
 
             if depth > 1:
-                all_nodes = _assign_parent_node_links(all_nodes, active_nodes)
+                all_nodes = _assign_parent_node_ids(all_nodes, active_nodes)
 
             all_nodes.extend(layer_nodes)
-            reserved_node_ids.update(node.node_id for node in layer_nodes)
             artifacts.nodes = all_nodes
             await self.writer.write_json(f"{wiki_root(self.config)}nodes.json", {"nodes": all_nodes})
 
@@ -236,21 +246,15 @@ class WikiPipeline:
                 },
             )
 
+            compilable_nodes = [node for node in active_nodes if node.node_kind == "stable_topic"]
             layer_contexts = await self._generate_layer_contexts(
-                active_nodes,
+                compilable_nodes,
                 assignment_result,
-                source_documents_by_id,
+                source_contexts,
+                resource_documents_by_id,
                 depth=depth,
             )
             all_contexts.extend(layer_contexts)
-            previous_layer_cards = [context.card for context in layer_contexts]
-            all_cards.extend(previous_layer_cards)
-            source_documents_by_id.update(
-                {
-                    context.node.node_id: _resource_document_for_node(self.config, context)
-                    for context in layer_contexts
-                }
-            )
             logger.info(
                 "[Wiki] Depth=%d generated %d node contexts (total=%d)",
                 depth,
@@ -259,18 +263,18 @@ class WikiPipeline:
             )
 
             artifacts.node_contexts = all_contexts
-            artifacts.cards = all_cards
 
             if depth >= self.config.limits.max_depth:
                 break
 
-            continue_upward = await self.layer_decision_runner.should_continue_upward(
-                layer_contexts,
-                min_child_nodes_per_parent=self.config.limits.min_child_nodes_per_parent,
+            continue_upward = (
+                depth < self.config.limits.max_depth
+                and len(layer_contexts) >= 2 * self.config.limits.min_child_nodes_per_parent
             )
-            logger.info("[Wiki] Depth=%d continue_upward=%s", depth, continue_upward)
+            logger.info("[Wiki] Depth=%d continue_upward=%s (deterministic size rule)", depth, continue_upward)
             if not continue_upward:
                 break
+            previous_layer_contexts = layer_contexts
 
         await self._write_run_records()
         logger.info(
@@ -286,7 +290,8 @@ class WikiPipeline:
         self,
         active_nodes: list[WikiNode],
         assignment_result: SourceAssignmentResult,
-        source_documents_by_id: dict[str, ResourceDocument],
+        all_contexts: list[GeneratedNodeContext],
+        resource_documents_by_id: dict[str, ResourceDocument],
         *,
         depth: int,
     ) -> list[GeneratedNodeContext]:
@@ -306,7 +311,9 @@ class WikiPipeline:
                 contexts[index] = await self._generate_node_context(
                     node,
                     assignment_result,
-                    source_documents_by_id,
+                    all_contexts,
+                    resource_documents_by_id,
+                    depth=depth,
                 )
                 logger.info("[Wiki] Depth=%d generated node context: %s", depth, node.node_id)
 
@@ -319,7 +326,10 @@ class WikiPipeline:
         self,
         node: WikiNode,
         assignment_result: SourceAssignmentResult,
-        source_documents_by_id: dict[str, ResourceDocument],
+        all_contexts: list[GeneratedNodeContext],
+        resource_documents_by_id: dict[str, ResourceDocument],
+        *,
+        depth: int,
     ) -> GeneratedNodeContext:
         source_refs = assignment_result.source_refs_by_node.get(node.node_id)
         if not source_refs:
@@ -328,28 +338,47 @@ class WikiPipeline:
         await self.writer.ensure_dirs([node.node_id])
         await self._write_source_refs(node, source_refs)
 
-        source_documents = _source_documents_for_refs(source_refs, source_documents_by_id)
-        documents = await self.content_generator.generate_node_documents(
-            node,
-            source_documents,
-            max_source_chars=self.config.limits.max_node_source_chars,
-            max_source_chars_per_document=self.config.limits.max_source_chars_per_document,
-        )
+        node_md = await self.content_generator.generate_node_md(node)
+        await self.writer.write_text(node_md_uri(self.config, node.node_id), node_md)
+
+        if depth == 1:
+            source_documents = _source_documents_for_resource_refs(source_refs, resource_documents_by_id)
+            compile_budget = _adaptive_compile_budget(source_documents, self.config)
+            logger.info(
+                "[Wiki] Node=%s compile budget: input_chars=%d per_source=%d evidence_chars=%d evidence_cards=%d",
+                node.node_id,
+                compile_budget["max_input_chars"],
+                compile_budget["max_chars_per_source"],
+                compile_budget["microcluster_chars"],
+                compile_budget["max_evidence_cards"],
+            )
+            documents = await self.content_generator.generate_node_documents(
+                node,
+                source_documents,
+                **compile_budget,
+            )
+        else:
+            assigned_child_contexts = _assigned_child_contexts(
+                node,
+                assignment_result,
+                all_contexts,
+            )
+            child_nodes = _child_node_document_inputs(assigned_child_contexts)
+            documents = await self.content_generator.generate_parent_node_documents(
+                node,
+                child_nodes,
+                max_input_chars=self.config.limits.max_compile_input_chars,
+                max_chars_per_source=self.config.limits.max_compile_chars_per_source,
+            )
         for document in documents:
             await self.writer.write_text(
                 node_document_uri(self.config, node.node_id, document.document_id),
                 document.content,
             )
-        card = await self.card_generator.generate_node_card(
-            node,
-            documents,
-            resource_uri=node_root_uri(self.config, node.node_id),
-        )
-        await self._write_node_card(node, card)
 
         context = GeneratedNodeContext(
             node=node,
-            card=card,
+            node_md=node_md,
             documents=documents,
             source_refs=source_refs,
         )
@@ -358,11 +387,7 @@ class WikiPipeline:
     async def _write_cards(self, cards: list[DocumentCard]) -> None:
         for card in cards:
             await self.writer.write_text(card_md_uri(self.config, card.doc_id), card.markdown)
-            await self.writer.write_json(card_json_uri(self.config, card.doc_id), card)
-
-    async def _write_node_card(self, node: WikiNode, card: DocumentCard) -> None:
-        await self.writer.write_text(node_card_md_uri(self.config, node.node_id), card.markdown)
-        await self.writer.write_json(node_card_json_uri(self.config, node.node_id), card)
+            await self.writer.write_json(f"{cards_dir(self.config)}{card.doc_id}.card.json", card)
 
     async def _write_source_refs(self, node: WikiNode, source_refs: list[SourceRef]) -> None:
         for source_ref in source_refs:
@@ -387,20 +412,21 @@ class WikiPipeline:
         )
 
 
-def _source_documents_for_refs(
+def _source_documents_for_resource_refs(
     source_refs: list[SourceRef],
-    source_documents_by_id: dict[str, ResourceDocument],
+    resource_documents_by_id: dict[str, ResourceDocument],
 ) -> list[dict]:
     source_documents: list[dict] = []
     for source_ref in source_refs:
-        resource_document = source_documents_by_id.get(source_ref.doc_id)
+        resource_document = resource_documents_by_id.get(source_ref.doc_id)
         if not resource_document:
-            raise RuntimeError(f"node source ref has no loaded source document: {source_ref.doc_id}")
+            raise RuntimeError(f"node source ref has no loaded resource document: {source_ref.doc_id}")
         if not resource_document.source_sections:
             raise RuntimeError(f"node source ref has no source sections: {source_ref.doc_id}")
         source_documents.append(
             {
-                "source_id": source_ref.doc_id,
+                "doc_id": source_ref.doc_id,
+                "topic_hints": source_ref.matched_topics,
                 "sections": [
                     section.model_dump(mode="json")
                     for section in resource_document.source_sections
@@ -408,6 +434,33 @@ def _source_documents_for_refs(
             }
         )
     return source_documents
+
+
+def _adaptive_compile_budget(source_documents: list[dict], config: WikiConfig) -> dict[str, int]:
+    """Allocate context from topic evidence, not from a dataset-specific constant.
+
+    The cap intentionally remains well below a long-context model's maximum:
+    unrelated evidence degrades synthesis quality even when it fits.
+    """
+    document_count = max(1, len(source_documents))
+    total_chars = sum(
+        len(str(section.get("content", "")))
+        for source in source_documents
+        for section in source.get("sections", [])
+    )
+    base = int(config.limits.max_compile_input_chars)
+    cap = max(base, int(config.limits.max_adaptive_compile_input_chars))
+    evidence_budget = max(base, int(30000 * math.sqrt(document_count)))
+    max_input_chars = min(cap, evidence_budget, max(base, total_chars))
+    max_chars_per_source = min(16000, max(6000, max_input_chars // max(4, document_count)))
+    microcluster_chars = min(48000, max(12000, max_input_chars // 4))
+    max_evidence_cards = min(12, max(4, int(math.ceil(document_count / 5))))
+    return {
+        "max_input_chars": max_input_chars,
+        "max_chars_per_source": max_chars_per_source,
+        "microcluster_chars": microcluster_chars,
+        "max_evidence_cards": max_evidence_cards,
+    }
 
 
 def _redact_sensitive_config(value: object) -> object:
@@ -421,28 +474,70 @@ def _redact_sensitive_config(value: object) -> object:
     return value
 
 
+def _child_node_document_inputs(
+    child_contexts: list[GeneratedNodeContext],
+) -> list[dict]:
+    child_nodes: list[dict] = []
+
+    for context in child_contexts:
+        child_nodes.append(
+            {
+                "title": context.node.title,
+                "scope": context.node.scope,
+                "documents": [
+                    {
+                        "content": document.content,
+                    }
+                    for document in context.documents
+                ],
+            }
+        )
+
+    return child_nodes
+
+
 def _reject_nodes_with_insufficient_refs(
     layer_nodes: list[WikiNode],
     active_nodes: list[WikiNode],
     assignment_result: SourceAssignmentResult,
-    min_sources: int,
+    min_refs_per_node: int,
+    min_child_nodes_per_parent: int,
+    child_contexts: list[GeneratedNodeContext] | None = None,
     *,
     depth: int,
 ) -> tuple[list[WikiNode], list[WikiNode], SourceAssignmentResult]:
-    min_sources = max(1, min_sources)
+    min_refs = max(1, min_refs_per_node)
+    min_child_nodes = max(1, min_child_nodes_per_parent)
     is_parent_layer = depth > 1
+    if is_parent_layer and not child_contexts:
+        raise RuntimeError("parent layer requires child contexts")
+    child_doc_ids_by_node = (
+        {
+            context.node.node_id: {ref.doc_id for ref in context.source_refs}
+            for context in child_contexts or []
+        }
+        if is_parent_layer
+        else {}
+    )
     unsupported_node_ids = {
         node.node_id
         for node in active_nodes
-        if len(assignment_result.source_refs_by_node.get(node.node_id, [])) < min_sources
+        if (
+            len(_assigned_child_node_ids(node.node_id, assignment_result, child_doc_ids_by_node))
+            < min_child_nodes
+            if is_parent_layer
+            else len(assignment_result.source_refs_by_node.get(node.node_id, [])) < min_refs
+        )
+        and not (not is_parent_layer and node.node_kind in {"leaf_topic", "outlier"})
     }
 
     updated_layer_nodes = [
-        _with_child_node_ids_from_refs(
+        _with_assigned_child_node_ids(
             node.model_copy(update={"status": "rejected"})
             if node.node_id in unsupported_node_ids
             else node,
             assignment_result,
+            child_doc_ids_by_node,
         )
         for node in layer_nodes
     ]
@@ -461,6 +556,11 @@ def _reject_nodes_with_insufficient_refs(
                 for node_id, refs in assignment_result.source_refs_by_node.items()
                 if node_id in supported_node_ids
             },
+            "child_node_ids_by_node": {
+                node_id: child_node_ids
+                for node_id, child_node_ids in assignment_result.child_node_ids_by_node.items()
+                if node_id in supported_node_ids
+            },
         }
     )
     return (
@@ -470,58 +570,57 @@ def _reject_nodes_with_insufficient_refs(
     )
 
 
-def _with_child_node_ids_from_refs(
+def _with_assigned_child_node_ids(
     node: WikiNode,
     assignment_result: SourceAssignmentResult,
+    child_doc_ids_by_node: dict[str, set[str]],
 ) -> WikiNode:
-    child_node_ids = [
-        ref.doc_id
-        for ref in assignment_result.source_refs_by_node.get(node.node_id, [])
-        if ref.ref_type == "wiki_node"
-    ]
-    if not child_node_ids:
+    if not child_doc_ids_by_node:
         return node
+    child_node_ids = _assigned_child_node_ids(node.node_id, assignment_result, child_doc_ids_by_node)
     return node.model_copy(update={"child_node_ids": child_node_ids})
 
 
-def _assign_parent_node_links(
+def _assigned_child_contexts(
+    node: WikiNode,
+    assignment_result: SourceAssignmentResult,
+    child_contexts: list[GeneratedNodeContext],
+) -> list[GeneratedNodeContext]:
+    child_node_ids = set(assignment_result.child_node_ids_by_node.get(node.node_id) or node.child_node_ids)
+    if not child_node_ids:
+        raise RuntimeError(f"parent node {node.node_id} has no assigned child nodes")
+    return [context for context in child_contexts if context.node.node_id in child_node_ids]
+
+
+def _assign_parent_node_ids(
     nodes: list[WikiNode],
     parent_nodes: list[WikiNode],
 ) -> list[WikiNode]:
-    parent_ids_by_child_id: dict[str, list[str]] = {}
+    parents_by_child_id: dict[str, list[str]] = {}
     for parent in parent_nodes:
         for child_node_id in parent.child_node_ids:
-            parent_ids_by_child_id.setdefault(child_node_id, []).append(parent.node_id)
-
-    updated_nodes: list[WikiNode] = []
-    for node in nodes:
-        parent_ids = parent_ids_by_child_id.get(node.node_id)
-        if not parent_ids:
-            updated_nodes.append(node)
-            continue
-        updated_nodes.append(
-            node.model_copy(
-                update={"parent_node_ids": list(dict.fromkeys([*node.parent_node_ids, *parent_ids]))}
-            )
-        )
-    return updated_nodes
+            parents_by_child_id.setdefault(child_node_id, []).append(parent.node_id)
+    return [
+        node.model_copy(update={
+            "parent_node_id": (parents_by_child_id.get(node.node_id) or [None])[0],
+            "parent_node_ids": parents_by_child_id.get(node.node_id, []),
+            "relation_types": {pid: "topic-subtopic" for pid in parents_by_child_id.get(node.node_id, [])},
+        })
+        if node.node_id in parents_by_child_id else node
+        for node in nodes
+    ]
 
 
-def _resource_document_for_node(
-    config: WikiConfig,
-    context: GeneratedNodeContext,
-) -> ResourceDocument:
-    return ResourceDocument(
-        doc_id=context.node.node_id,
-        resource_uri=node_root_uri(config, context.node.node_id),
-        title=context.node.title,
-        content_or_structure="\n\n".join(document.content for document in context.documents),
-        source_sections=[
-            {
-                "section_uri": node_document_uri(config, context.node.node_id, document.document_id),
-                "content": document.content,
-            }
-            for document in context.documents
-        ],
-        metadata={"source_type": "wiki_node"},
-    )
+def _assigned_child_node_ids(
+    node_id: str,
+    assignment_result: SourceAssignmentResult,
+    child_doc_ids_by_node: dict[str, set[str]],
+) -> list[str]:
+    explicit_child_node_ids = assignment_result.child_node_ids_by_node.get(node_id, [])
+    if explicit_child_node_ids:
+        return explicit_child_node_ids
+    return [
+        ref.doc_id
+        for ref in assignment_result.source_refs_by_node.get(node_id, [])
+        if ref.ref_type == "wiki_node" and ref.doc_id in child_doc_ids_by_node
+    ]

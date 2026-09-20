@@ -1,5 +1,5 @@
 project_name: "Wiki_Benchmark"
-dataset_name: "paperscope_summary_93_gap"
+dataset_name: "paperscope_summary_57_trend"
 
 adapter:
   module: "src.adapters.paperscope_summary_adapter"
@@ -10,20 +10,21 @@ execution:
   server_port: 2026
   max_workers: 1
   retrieval_topk: 5
-  max_queries: null
+  max_queries: 5
   skip_ingestion: false
   ingest_mode: "directory"
-  build_wiki: false
+  build_wiki: true
   wiki_card_input_mode: "summary"
   wiki_max_card_input_chars: 20000
   retrieval_instruction: ""
+  tool_policy: "dedup"
 
 paths:
-  dataset_path: "datasets/PaperScopeSummary93/summary_gap.jsonl"
-  doc_output_dir: "wiki_storage/paperscope_summary_93/paperscope_summary_93_processed_docs"
-  vector_store: "wiki_storage/paperscope_summary_93/paperscope_summary_93_viking_store_index"
-  output_dir: "Output/{dataset_name}/wiki"
-  log_file: "Output/{dataset_name}/wiki/benchmark.log"
+  dataset_path: "datasets/PaperScopeSummary57/summary_trend.jsonl"
+  doc_output_dir: "wiki_storage/paperscope_summary_57/paperscope_summary_57_processed_docs"
+  vector_store: "wiki_storage/paperscope_summary_57/paperscope_summary_57_viking_store_index"
+  output_dir: "Output/{dataset_name}/wiki_soft_dedup_m5"
+  log_file: "Output/{dataset_name}/wiki_soft_dedup_m5/benchmark.log"
 
 llm:
   model: "${OV_VLM_MODEL}"

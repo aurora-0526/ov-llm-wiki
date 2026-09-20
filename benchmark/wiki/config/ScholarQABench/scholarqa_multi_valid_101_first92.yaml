@@ -1,16 +1,16 @@
 project_name: "Wiki_Benchmark"
-dataset_name: "enterprise_rag_bench_selected_80"
+dataset_name: "scholarqa_multi_valid_101"
 
 adapter:
-  module: "src.adapters.enterprise_rag_bench_adapter"
-  class_name: "EnterpriseRAGBenchAdapter"
+  module: "src.adapters.scholarqa_multi_adapter"
+  class_name: "ScholarQAMultiAdapter"
 
 execution:
   mode: "vikingbot"
   server_port: 2026
   max_workers: 1
   retrieval_topk: 5
-  max_queries: null
+  max_queries: 92
   skip_ingestion: false
   ingest_mode: "directory"
   build_wiki: false
@@ -19,9 +19,9 @@ execution:
   retrieval_instruction: ""
 
 paths:
-  dataset_path: "datasets/EnterpriseRAGBenchSelected80/questions_selected_80.jsonl"
-  doc_output_dir: "wiki_storage/enterprise_rag_bench_selected_80/enterprise_rag_bench_selected_80_processed_docs"
-  vector_store: "wiki_storage/enterprise_rag_bench_selected_80/enterprise_rag_bench_selected_80_viking_store_index"
+  dataset_path: "datasets/ScholarQAMultiValid101/scholarqa_multi_valid_101.json"
+  doc_output_dir: "wiki_storage/scholarqa_multi_valid_101/scholarqa_multi_valid_101_processed_docs"
+  vector_store: "wiki_storage/scholarqa_multi_valid_101/scholarqa_multi_valid_101_viking_store_index"
   output_dir: "Output/{dataset_name}/wiki"
   log_file: "Output/{dataset_name}/wiki/benchmark.log"
 

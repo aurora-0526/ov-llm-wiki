@@ -1,5 +1,5 @@
 project_name: "Wiki_Benchmark"
-dataset_name: "scholarqa_multi_valid_101"
+dataset_name: "scholarqa_multi_valid_101_adaptive_graph_catalog_qa"
 
 adapter:
   module: "src.adapters.scholarqa_multi_adapter"
@@ -7,16 +7,28 @@ adapter:
 
 execution:
   mode: "vikingbot"
-  server_port: 2026
+  server_port: 2032
   max_workers: 1
-  retrieval_topk: 5
+  retrieval_topk: 3
   max_queries: null
-  skip_ingestion: false
+  skip_ingestion: true
   ingest_mode: "directory"
   build_wiki: false
   wiki_card_input_mode: "summary"
   wiki_max_card_input_chars: 20000
-  retrieval_strategy: "wiki_first"
+  retrieval_strategy: "cluster_catalog"
+  tool_policy: "hard_cap"
+  # The runner enables evidence-gain stopping by default for benchmark QA.
+  evidence_gain_stop: true
+  evidence_gain_patience: 2
+  evidence_gain_min_iteration: 2
+  wiki_root_uri: "viking://wiki/scholarqa_multi_valid_101_adaptive_graph_catalog/"
+  wiki_retrieval_topk: 5
+  original_fallback_topk: 3
+  seed_chunk_topk: 8
+  catalog_max_nodes: 4
+  catalog_docs_per_node: 12
+  catalog_max_chars: 18000
   retrieval_instruction: ""
 
 paths:

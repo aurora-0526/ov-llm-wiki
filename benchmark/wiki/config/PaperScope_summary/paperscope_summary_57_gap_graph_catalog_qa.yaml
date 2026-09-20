@@ -1,5 +1,5 @@
 project_name: "Wiki_Benchmark"
-dataset_name: "paperscope_summary_57_gap"
+dataset_name: "paperscope_summary_57_gap_graph_catalog_qa"
 
 adapter:
   module: "src.adapters.paperscope_summary_adapter"
@@ -7,15 +7,24 @@ adapter:
 
 execution:
   mode: "vikingbot"
-  server_port: 2026
+  server_port: 2034
   max_workers: 1
-  retrieval_topk: 5
+  retrieval_topk: 3
   max_queries: null
-  skip_ingestion: false
+  skip_ingestion: true
   ingest_mode: "directory"
   build_wiki: false
   wiki_card_input_mode: "summary"
   wiki_max_card_input_chars: 20000
+  retrieval_strategy: "cluster_catalog"
+  tool_policy: "hard_cap"
+  wiki_root_uri: "viking://wiki/paperscope_summary_57_graph_catalog/"
+  wiki_retrieval_topk: 5
+  original_fallback_topk: 3
+  seed_chunk_topk: 8
+  catalog_max_nodes: 4
+  catalog_docs_per_node: 12
+  catalog_max_chars: 18000
   retrieval_instruction: ""
 
 paths:

@@ -124,6 +124,7 @@ class VikingStoreWrapper:
         resource_uris: list[str],
         card_input_mode: str = "summary",
         max_card_input_chars: int = 20000,
+        wiki_root_uri: str = "viking://wiki/",
     ) -> dict:
         start_time = time.time()
         if not resource_uris:
@@ -136,6 +137,8 @@ class VikingStoreWrapper:
             resource_uris=resource_uris,
             card_input_mode=card_input_mode,
             max_card_input_chars=max_card_input_chars,
+            wiki_root_uri=wiki_root_uri,
+            telemetry=True,
         )
         result["time"] = time.time() - start_time
         return result

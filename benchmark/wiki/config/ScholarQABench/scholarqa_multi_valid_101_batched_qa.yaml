@@ -1,5 +1,5 @@
 project_name: "Wiki_Benchmark"
-dataset_name: "scholarqa_multi_valid_101"
+dataset_name: "scholarqa_multi_valid_101_batched_qa"
 
 adapter:
   module: "src.adapters.scholarqa_multi_adapter"
@@ -7,16 +7,20 @@ adapter:
 
 execution:
   mode: "vikingbot"
-  server_port: 2026
+  server_port: 2027
   max_workers: 1
-  retrieval_topk: 5
+  retrieval_topk: 3
   max_queries: null
-  skip_ingestion: false
+  skip_ingestion: true
   ingest_mode: "directory"
   build_wiki: false
   wiki_card_input_mode: "summary"
   wiki_max_card_input_chars: 20000
   retrieval_strategy: "wiki_first"
+  tool_policy: "hard_cap"
+  wiki_root_uri: "viking://wiki/scholarqa_multi_valid_101_batched/"
+  wiki_retrieval_topk: 5
+  original_fallback_topk: 3
   retrieval_instruction: ""
 
 paths:

@@ -32,7 +32,7 @@ execution:
   # - "per_file": 按文件入库模式，每个文件作为一个独立文档处理
   ingest_mode: "per_file"
   # add_resource 语义索引完成后，是否构建 Wiki cards/nodes
-  build_wiki: true
+  build_wiki: false
   # Wiki card 输入模式：
   # - "summary": 递归读取语义记录摘要和目录 overview 文本
   # - "raw_chunk": 递归读取原始资源叶子节点内容
