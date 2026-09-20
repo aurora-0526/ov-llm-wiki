@@ -29,7 +29,15 @@ class NodeContentGenerator:
         self,
         node: WikiNode,
         source_documents: list[dict],
+        *,
+        max_source_chars: int = 60000,
+        max_source_chars_per_document: int = 8000,
     ) -> list[NodeDocument]:
+        source_documents = _build_evidence_pack(
+            source_documents,
+            max_source_chars=max_source_chars,
+            max_source_chars_per_document=max_source_chars_per_document,
+        )
         prompt = build_node_documents_prompt(
             node,
             source_documents,
@@ -57,6 +65,52 @@ class NodeContentGenerator:
             raise RuntimeError(f"node_documents for {node.node_id} is empty")
         return documents
 
+
+def _build_evidence_pack(
+    source_documents: list[dict],
+    *,
+    max_source_chars: int,
+    max_source_chars_per_document: int,
+) -> list[dict]:
+    """Bound compiler input while retaining coverage across the cluster.
+
+    Documents are sampled in round-robin order and each document keeps its
+    section headers/URIs. This is deliberately deterministic, so reruns do
+    not change the Wiki solely because of sampling order.
+    """
+    docs = list(source_documents or [])
+    if not docs:
+        return []
+    total_budget = max(4000, int(max_source_chars or 60000))
+    per_doc = max(1000, int(max_source_chars_per_document or 8000))
+    selected: list[dict] = []
+    used = 0
+    for index, doc in enumerate(docs):
+        sections = list(doc.get("sections") or [])
+        if not sections:
+            continue
+        # Every source gets a chance to contribute before any source gets a
+        # second section, which avoids large documents dominating the pack.
+        compact_sections = []
+        remaining_doc = per_doc
+        for section in sections:
+            if remaining_doc <= 0 or used >= total_budget:
+                break
+            content = str(section.get("content") or "")
+            if not content:
+                continue
+            remaining = min(remaining_doc, total_budget - used)
+            if len(content) > remaining:
+                content = content[: max(200, remaining - 24)].rstrip() + "\n...(truncated)"
+            compact_sections.append({**section, "content": content})
+            consumed = len(content)
+            remaining_doc -= consumed
+            used += consumed
+        if compact_sections:
+            selected.append({**doc, "sections": compact_sections})
+        if used >= total_budget:
+            break
+    return selected
 
 def _build_node_documents(document_contents: list) -> list[NodeDocument]:
     return [

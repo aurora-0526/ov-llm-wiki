@@ -38,7 +38,16 @@ class LayerDecisionRunner:
                     prompt=prompt,
                     schema=NextLayerDecisionResponse.model_json_schema(),
                 )
-                response = NextLayerDecisionResponse.model_validate(result)
+                # Some providers retain fields from an earlier parent-node
+                # planning format. This step only needs the decision fields;
+                # ignore unrelated keys instead of failing a completed build.
+                response = NextLayerDecisionResponse.model_validate(
+                    {
+                        key: result[key]
+                        for key in ("continue_upward", "reasons")
+                        if key in result
+                    }
+                )
                 return response.continue_upward
             except (RuntimeError, ValidationError) as exc:
                 last_error = exc

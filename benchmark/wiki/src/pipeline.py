@@ -130,22 +130,39 @@ class BenchmarkPipeline:
             max_card_input_chars=wiki_max_card_input_chars,
         )
         token_usage = wiki_stats.get("token_usage") or {}
-        total_usage = token_usage.get("total_usage") or {}
+        # OpenViking normally returns ``total_usage``; accept a flat usage
+        # payload as well so build metrics are not silently reported as zero.
+        total_usage = token_usage.get("total_usage") or token_usage
+        wiki_input_tokens = int(
+            total_usage.get("prompt_tokens", total_usage.get("input_tokens", 0)) or 0
+        )
+        wiki_output_tokens = int(
+            total_usage.get("completion_tokens", total_usage.get("output_tokens", 0)) or 0
+        )
+        wiki_total_tokens = int(
+            total_usage.get("total_tokens") or (wiki_input_tokens + wiki_output_tokens)
+        )
+        wiki_call_count = int(total_usage.get("call_count", 0) or 0)
         self.metrics_summary["wiki_generation"] = {
             "time": wiki_stats["time"],
-            "input_tokens": total_usage.get("prompt_tokens", 0),
-            "output_tokens": total_usage.get("completion_tokens", 0),
-            "total_tokens": total_usage.get("total_tokens", 0),
-            "call_count": total_usage.get("call_count", 0),
+            "input_tokens": wiki_input_tokens,
+            "output_tokens": wiki_output_tokens,
+            "total_tokens": wiki_total_tokens,
+            "call_count": wiki_call_count,
         }
-        self.logger.info(f"Wiki build finished. Time: {wiki_stats['time']:.2f}s")
+        self.logger.info(
+            "Wiki build finished. Time: %.2fs, input_tokens=%d, output_tokens=%d, "
+            "total_tokens=%d, llm_calls=%d",
+            wiki_stats["time"], wiki_input_tokens, wiki_output_tokens,
+            wiki_total_tokens, wiki_call_count,
+        )
         self._update_report({
             "Wiki Generation": {
                 "Total Wiki Build Time (s)": wiki_stats["time"],
-                "Total Input Tokens": total_usage.get("prompt_tokens", 0),
-                "Total Output Tokens": total_usage.get("completion_tokens", 0),
-                "Total Tokens": total_usage.get("total_tokens", 0),
-                "LLM Call Count": total_usage.get("call_count", 0),
+                "Total Input Tokens": wiki_input_tokens,
+                "Total Output Tokens": wiki_output_tokens,
+                "Total Tokens": wiki_total_tokens,
+                "LLM Call Count": wiki_call_count,
                 "Resource Roots": resource_uris,
                 "Status": wiki_stats.get("status"),
                 "Cards": wiki_stats.get("cards", 0),

@@ -332,6 +332,8 @@ class WikiPipeline:
         documents = await self.content_generator.generate_node_documents(
             node,
             source_documents,
+            max_source_chars=self.config.limits.max_node_source_chars,
+            max_source_chars_per_document=self.config.limits.max_source_chars_per_document,
         )
         for document in documents:
             await self.writer.write_text(

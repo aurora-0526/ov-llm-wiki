@@ -363,14 +363,23 @@ class VikingBotRunner:
             logger.info(f"Using vector store: {self.vector_store_path}")
             _ensure_openviking_server(ov_conf_path)
 
+            wiki_root = str(
+                self.config.get("execution", {}).get("wiki_root_uri")
+                or "viking://wiki/"
+            ).rstrip("/")
+            wiki_topk = int(self.config.get("execution", {}).get("wiki_retrieval_topk", 5) or 5)
+            fallback_topk = int(self.config.get("execution", {}).get("original_fallback_topk", 3) or 3)
+            max_rounds = int(self.config.get("execution", {}).get("max_retrieval_rounds", 2) or 2)
             input_msg = (
-                "Answer this question as briefly as possible. "
-                "Use only the information available in the database. "
-                "Do not use any external source. "
-                "Always use OpenViking tools first. Search first, then read the results to answer. "
-                "Use the default OpenViking search scope; do not force a specific target_uri unless needed. "
-                "Search results may come from original resources or wiki nodes. "
-                "If wiki node documents are relevant, read them and use them as evidence together with original resources when useful."
+                "Answer the question using only the database and be concise. "
+                "Follow this retrieval policy exactly:\n"
+                f"1) Wiki-first: search the Wiki root {wiki_root} with at most {wiki_topk} hits. "
+                "Read the returned Wiki node cards/documents and treat them as a temporary, bounded catalog. "
+                "Only use content present in that catalog; do not enumerate the entire Wiki.\n"
+                "2) Decide whether the catalog contains enough evidence. If yes, answer immediately. "
+                f"If not, perform at most one fallback search over original resources, reading at most {fallback_topk} results.\n"
+                f"3) Use at most {max_rounds} retrieval rounds total. Do not issue exploratory list, glob, or grep calls. "
+                "Do not use external sources. Cite source titles or URIs when available."
                 f"\n\nQuestion: {question}"
             )
 

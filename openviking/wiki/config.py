@@ -18,6 +18,11 @@ class WikiGenerationLimits:
     max_concurrent_cards: int = 10
     # 同时发起多少个节点内容生成请求。
     max_concurrent_nodes: int = 10
+    # Upper bound for source evidence sent to one node compiler.  Large
+    # clusters are represented by a coverage-preserving evidence pack rather
+    # than exhausting the model context with every raw section.
+    max_node_source_chars: int = 60000
+    max_source_chars_per_document: int = 8000
 
 
 @dataclass

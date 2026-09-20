@@ -21,6 +21,10 @@ template: |
   - Use the node title and scope as the topic boundary: include content inside this boundary, and exclude related but out-of-scope content.
   - A source document may be an original resource document or a generated lower-layer Wiki node document.
   - Synthesize across source documents instead of summarizing each source separately.
+  - Prefer retrieval-useful knowledge: definitions, distinguishing features, method/claim comparisons, quantitative ranges, prerequisites, failure cases, and when a method does not apply.
+  - Make each important conclusion an atomic claim and append a compact evidence tag using the provided source URI or section URI (for example, [evidence: <URI>]). Never invent a URI.
+  - Resolve disagreements explicitly: state the condition or population under which each source applies instead of silently averaging conflicting claims.
+  - Start with a short "retrieval map" of the node's subtopics and keywords, followed by the synthesized claims. Keep this map compact.
   - Organize the content by synthesized knowledge, not by source document.
   - Do not write one paragraph for source 1, another paragraph for source 2, and so on.
   - Each substantive paragraph should present a higher-level conclusion, pattern, mechanism, tradeoff, or comparison derived from multiple source documents whenever multiple relevant source documents are available.

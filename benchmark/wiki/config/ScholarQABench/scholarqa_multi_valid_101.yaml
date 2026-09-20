@@ -10,6 +10,10 @@ execution:
   server_port: 2028
   max_workers: 8
   retrieval_topk: 5
+  wiki_root_uri: "viking://wiki/scholarqa_multi_valid_101_optimized/"
+  wiki_retrieval_topk: 5
+  original_fallback_topk: 3
+  max_retrieval_rounds: 2
   max_queries: null
   skip_ingestion: false
   ingest_mode: "directory"
